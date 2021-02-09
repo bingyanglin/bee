@@ -61,11 +61,11 @@ where
 
     let mut metadata = WhiteFlagMetadata::new(MilestoneIndex(milestone.essence().index()));
 
-    let (parent1, parent2) = (*message.parent1(), *message.parent2());
+    let parents = message.parents().to_vec();
 
     drop(message);
 
-    white_flag::traversal::<N>(tangle, storage, vec![parent1, parent2], &mut metadata).await?;
+    white_flag::traversal::<N>(tangle, storage, parents, &mut metadata).await?;
 
     // Account for the milestone itself.
     metadata.num_referenced_messages += 1;
@@ -284,10 +284,7 @@ where
         read_diffs(&*storage, full_diff_rx).await?;
         read_diffs(&*storage, delta_diff_rx).await?;
 
-        // TODO unwrap
-        if !check_ledger_state(&*storage).await.unwrap() {
-            return Err(Error::InvalidLedgerState);
-        }
+        check_ledger_state(&*storage).await?;
 
         // bus.add_listener::<Self, LatestSolidMilestoneChanged, _>(move |event| {
         //     if let Err(e) = tx.send(*event.milestone.message_id()) {

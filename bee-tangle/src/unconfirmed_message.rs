@@ -1,26 +1,21 @@
 // Copyright 2020 IOTA Stiftung
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::MessageId;
-
 use bee_common::packable::{Packable, Read, Write};
-
-use ref_cast::RefCast;
+use bee_message::MessageId;
 
 use std::ops::Deref;
 
-#[derive(RefCast)]
-#[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct SolidEntryPoint(MessageId);
+pub struct UnconfirmedMessage(MessageId);
 
-impl From<MessageId> for SolidEntryPoint {
+impl From<MessageId> for UnconfirmedMessage {
     fn from(message_id: MessageId) -> Self {
         Self(message_id)
     }
 }
 
-impl Deref for SolidEntryPoint {
+impl Deref for UnconfirmedMessage {
     type Target = MessageId;
 
     fn deref(&self) -> &Self::Target {
@@ -28,13 +23,9 @@ impl Deref for SolidEntryPoint {
     }
 }
 
-impl SolidEntryPoint {
+impl UnconfirmedMessage {
     pub fn new(message_id: MessageId) -> Self {
         message_id.into()
-    }
-
-    pub fn null() -> Self {
-        Self(MessageId::null())
     }
 
     pub fn message_id(&self) -> &MessageId {
@@ -42,7 +33,7 @@ impl SolidEntryPoint {
     }
 }
 
-impl Packable for SolidEntryPoint {
+impl Packable for UnconfirmedMessage {
     type Error = <MessageId as Packable>::Error;
 
     fn packed_len(&self) -> usize {

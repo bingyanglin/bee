@@ -33,6 +33,8 @@ use std::{any::TypeId, convert::Infallible};
 pub(crate) type NetworkId = (String, u64);
 pub(crate) type Bech32Hrp = String;
 
+pub(crate) const IS_SYNCED_THRESHOLD: u32 = 5;
+
 pub async fn init<N: Node>(
     rest_api_config: RestApiConfig,
     protocol_config: ProtocolConfig,
@@ -122,11 +124,7 @@ async fn handle_rejection(err: Rejection) -> Result<impl Reply, Infallible> {
             if err.is_not_found() {
                 (StatusCode::NOT_FOUND, "404".to_string(), "data not found".to_string())
             } else if err.find::<warp::reject::MethodNotAllowed>().is_some() {
-                (
-                    StatusCode::FORBIDDEN,
-                    "403".to_string(),
-                    "access forbidden".to_string(),
-                )
+                (StatusCode::FORBIDDEN, "403".to_string(), "access forbidden".to_string())
             } else {
                 error!("unhandled rejection: {:?}", err);
                 (

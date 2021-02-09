@@ -5,6 +5,7 @@ use crate::{
     filters::CustomRejection::ServiceUnavailable,
     handlers::{BodyInner, SuccessBody},
     storage::StorageBackend,
+    IS_SYNCED_THRESHOLD,
 };
 
 use bee_runtime::resource::ResourceHandle;
@@ -14,10 +15,14 @@ use serde::{Deserialize, Serialize};
 use warp::{reject, Rejection, Reply};
 
 pub(crate) async fn tips<B: StorageBackend>(tangle: ResourceHandle<MsTangle<B>>) -> Result<impl Reply, Rejection> {
+    if !tangle.is_synced_threshold(IS_SYNCED_THRESHOLD) {
+        return Err(reject::custom(ServiceUnavailable(
+            "the node is not synchronized".to_string(),
+        )));
+    }
     match tangle.get_messages_to_approve().await {
         Some(tips) => Ok(warp::reply::json(&SuccessBody::new(TipsResponse {
-            tip_1_message_id: tips.0.to_string(),
-            tip_2_message_id: tips.1.to_string(),
+            tip_message_ids: tips.iter().map(|t| t.to_string()).collect(),
         }))),
         None => Err(reject::custom(ServiceUnavailable("tip pool is empty".to_string()))),
     }
@@ -26,10 +31,8 @@ pub(crate) async fn tips<B: StorageBackend>(tangle: ResourceHandle<MsTangle<B>>)
 /// Response of GET /api/v1/tips
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TipsResponse {
-    #[serde(rename = "tip1MessageId")]
-    pub tip_1_message_id: String,
-    #[serde(rename = "tip2MessageId")]
-    pub tip_2_message_id: String,
+    #[serde(rename = "tipMessageIds")]
+    pub tip_message_ids: Vec<String>,
 }
 
 impl BodyInner for TipsResponse {}

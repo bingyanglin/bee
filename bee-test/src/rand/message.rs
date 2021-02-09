@@ -26,17 +26,17 @@ pub fn rand_payload() -> Payload {
     rand_indexation().into()
 }
 
-pub fn rand_message_with_parents(parent1: MessageId, parent2: MessageId) -> Message {
+pub fn rand_message_with_parents(parents: Vec<MessageId>) -> Message {
     MessageBuilder::<Constant>::new()
         .with_network_id(rand_integer())
-        .with_parent1(parent1)
-        .with_parent2(parent2)
+        .with_parents(parents)
         .with_payload(rand_payload())
-        .with_nonce_provider(ConstantBuilder::new().with_value(rand_integer()).finish(), 0f64)
+        .with_nonce_provider(ConstantBuilder::new().with_value(rand_integer()).finish(), 0f64, None)
         .finish()
         .unwrap()
 }
 
 pub fn rand_message() -> Message {
-    rand_message_with_parents(rand_message_id(), rand_message_id())
+    // TODO variable number of parents
+    rand_message_with_parents(vec![rand_message_id(), rand_message_id()])
 }

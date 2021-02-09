@@ -8,7 +8,20 @@ mod topics;
 use commands::WsCommand;
 use topics::WsTopic;
 
-use futures::{FutureExt, StreamExt};
+use crate::{
+    plugins::dashboard::{
+        send_to_specific,
+        websocket::responses::{
+            database_size_metrics::DatabaseSizeMetricsResponse, sync_status::SyncStatusResponse, WsEvent, WsEventInner,
+        },
+    },
+    storage::StorageBackend,
+};
+
+use bee_runtime::{resource::ResourceHandle, shutdown_stream::ShutdownStream};
+use bee_tangle::MsTangle;
+
+use futures::{channel::oneshot, FutureExt, StreamExt};
 use log::{debug, error};
 use tokio::sync::{mpsc, RwLock};
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -28,6 +41,7 @@ static NEXT_USER_ID: AtomicUsize = AtomicUsize::new(1);
 
 pub(crate) struct WsUser {
     pub(crate) tx: mpsc::UnboundedSender<Result<Message, warp::Error>>,
+    pub(crate) shutdown: Option<oneshot::Sender<()>>,
     pub(crate) topics: HashSet<WsTopic>,
 }
 
@@ -37,7 +51,12 @@ pub(crate) struct WsUser {
 /// - Value is a sender of `warp::ws::Message`
 pub(crate) type WsUsers = Arc<RwLock<HashMap<usize, WsUser>>>;
 
-pub(crate) async fn user_connected(ws: WebSocket, users: WsUsers) {
+pub(crate) async fn user_connected<B: StorageBackend>(
+    ws: WebSocket,
+    users: WsUsers,
+    tangle: ResourceHandle<MsTangle<B>>,
+    storage: ResourceHandle<B>,
+) {
     // Use a counter to assign a new unique ID for this user.
     let user_id = NEXT_USER_ID.fetch_add(1, Ordering::Relaxed);
 
@@ -49,8 +68,10 @@ pub(crate) async fn user_connected(ws: WebSocket, users: WsUsers) {
     // Use an unbounded channel to handle buffering and flushing of messages
     // to the websocket...
     let (tx, rx) = mpsc::unbounded_channel();
-    let rx = UnboundedReceiverStream::new(rx);
-    tokio::task::spawn(rx.forward(ws_tx).map(|result| {
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let receiver = ShutdownStream::new(shutdown_rx, UnboundedReceiverStream::new(rx));
+
+    tokio::task::spawn(receiver.forward(ws_tx).map(|result| {
         if let Err(e) = result {
             error!("websocket send error: {}", e);
         }
@@ -61,22 +82,8 @@ pub(crate) async fn user_connected(ws: WebSocket, users: WsUsers) {
         user_id,
         WsUser {
             tx,
-            topics: {
-                let mut t = HashSet::new();
-                t.insert(WsTopic::ConfirmedInfo);
-                t.insert(WsTopic::ConfirmedMilestoneMetrics);
-                t.insert(WsTopic::DatabaseSizeMetrics);
-                t.insert(WsTopic::Milestone);
-                t.insert(WsTopic::MilestoneInfo);
-                t.insert(WsTopic::MPSMetrics);
-                t.insert(WsTopic::NodeStatus);
-                t.insert(WsTopic::SolidInfo);
-                t.insert(WsTopic::SyncStatus);
-                t.insert(WsTopic::TipInfo);
-                t.insert(WsTopic::Vertex);
-                t.insert(WsTopic::PeerMetrics);
-                t
-            },
+            shutdown: Some(shutdown_tx),
+            topics: HashSet::new(),
         },
     );
 
@@ -89,7 +96,7 @@ pub(crate) async fn user_connected(ws: WebSocket, users: WsUsers) {
                 break;
             }
         };
-        user_message(user_id, msg, &users).await;
+        user_message(user_id, msg, &users, &tangle, &storage).await;
     }
 
     // ws_rx stream will keep processing as long as the user stays
@@ -97,7 +104,13 @@ pub(crate) async fn user_connected(ws: WebSocket, users: WsUsers) {
     user_disconnected(user_id, &users).await;
 }
 
-async fn user_message(user_id: usize, msg: Message, users: &WsUsers) {
+async fn user_message<B: StorageBackend>(
+    user_id: usize,
+    msg: Message,
+    users: &WsUsers,
+    tangle: &MsTangle<B>,
+    storage: &B,
+) {
     if msg.is_binary() {
         let bytes = msg.as_bytes();
         if bytes.len() >= 2 {
@@ -119,6 +132,7 @@ async fn user_message(user_id: usize, msg: Message, users: &WsUsers) {
             if let Some(user) = users.write().await.get_mut(&user_id) {
                 match command {
                     WsCommand::Register => {
+                        send_init_values_for_topics(&topic, &user, tangle, storage).await;
                         let _ = user.topics.insert(topic);
                     }
                     WsCommand::Unregister => {
@@ -134,4 +148,35 @@ async fn user_disconnected(user_id: usize, users: &WsUsers) {
     debug!("User {} disconnected.", user_id);
     // Stream closed up, so remove from the user list
     users.write().await.remove(&user_id);
+}
+
+async fn send_init_values_for_topics<B: StorageBackend>(
+    topic: &WsTopic,
+    user: &WsUser,
+    tangle: &MsTangle<B>,
+    storage: &B,
+) {
+    match topic {
+        &WsTopic::SyncStatus => {
+            let event = WsEvent::new(
+                WsTopic::SyncStatus,
+                WsEventInner::SyncStatus(SyncStatusResponse {
+                    lmi: *tangle.get_latest_milestone_index(),
+                    lsmi: *tangle.get_latest_solid_milestone_index(),
+                }),
+            );
+            send_to_specific(event, user).await;
+        }
+        &WsTopic::DatabaseSizeMetrics => {
+            let event = WsEvent::new(
+                WsTopic::DatabaseSizeMetrics,
+                WsEventInner::DatabaseSizeMetrics(DatabaseSizeMetricsResponse {
+                    total: storage.size().await.unwrap().unwrap() as u64,
+                    ts: 0,
+                }),
+            );
+            send_to_specific(event, user).await;
+        }
+        _ => {}
+    }
 }

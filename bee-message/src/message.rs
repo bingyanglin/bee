@@ -12,13 +12,18 @@ use blake2::{
 };
 use serde::{Deserialize, Serialize};
 
+use std::{
+    ops::RangeInclusive,
+    sync::{atomic::AtomicBool, Arc},
+};
+
 pub const MESSAGE_LENGTH_MAX: usize = 32768;
+pub const MESSAGE_PARENTS_RANGE: RangeInclusive<usize> = 1..=8;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Message {
     network_id: u64,
-    parent1: MessageId,
-    parent2: MessageId,
+    parents: Vec<MessageId>,
     payload: Option<Payload>,
     nonce: u64,
 }
@@ -44,12 +49,8 @@ impl Message {
         self.network_id
     }
 
-    pub fn parent1(&self) -> &MessageId {
-        &self.parent1
-    }
-
-    pub fn parent2(&self) -> &MessageId {
-        &self.parent2
+    pub fn parents(&self) -> &[MessageId] {
+        &self.parents
     }
 
     pub fn payload(&self) -> &Option<Payload> {
@@ -66,8 +67,8 @@ impl Packable for Message {
 
     fn packed_len(&self) -> usize {
         self.network_id.packed_len()
-            + self.parent1.packed_len()
-            + self.parent2.packed_len()
+            + 0u8.packed_len()
+            + self.parents.len() * MESSAGE_ID_LENGTH
             + 0u32.packed_len()
             + self.payload.as_ref().map_or(0, Packable::packed_len)
             + 0u64.packed_len()
@@ -76,8 +77,11 @@ impl Packable for Message {
     fn pack<W: Write>(&self, writer: &mut W) -> Result<(), Self::Error> {
         self.network_id.pack(writer)?;
 
-        self.parent1.pack(writer)?;
-        self.parent2.pack(writer)?;
+        (self.parents().len() as u8).pack(writer)?;
+
+        for parent in self.parents().iter() {
+            parent.pack(writer)?;
+        }
 
         if let Some(ref payload) = self.payload {
             (payload.packed_len() as u32).pack(writer)?;
@@ -94,8 +98,16 @@ impl Packable for Message {
     fn unpack<R: Read + ?Sized>(reader: &mut R) -> Result<Self, Self::Error> {
         let network_id = u64::unpack(reader)?;
 
-        let parent1 = MessageId::unpack(reader)?;
-        let parent2 = MessageId::unpack(reader)?;
+        let parents_len = u8::unpack(reader)? as usize;
+
+        if !MESSAGE_PARENTS_RANGE.contains(&parents_len) {
+            return Err(Error::InvalidParentsCount(parents_len));
+        }
+
+        let mut parents = Vec::with_capacity(parents_len);
+        for _ in 0..parents_len {
+            parents.push(MessageId::unpack(reader)?);
+        }
 
         let payload_len = u32::unpack(reader)? as usize;
         let payload = if payload_len != 0 {
@@ -113,7 +125,7 @@ impl Packable for Message {
         // Computed instead of calling `packed_len` on Self because `payload_len` is already known and it may be
         // expensive to call `payload.packed_len()` twice.
         let message_len =
-            network_id.packed_len() + parent1.packed_len() + parent2.packed_len() + payload_len + nonce.packed_len();
+            network_id.packed_len() + parents.len() * MESSAGE_ID_LENGTH + payload_len + nonce.packed_len();
 
         if message_len > MESSAGE_LENGTH_MAX {
             return Err(Error::InvalidMessageLength(message_len));
@@ -121,8 +133,7 @@ impl Packable for Message {
 
         Ok(Self {
             network_id,
-            parent1,
-            parent2,
+            parents,
             payload,
             nonce,
         })
@@ -131,18 +142,16 @@ impl Packable for Message {
 
 pub struct MessageBuilder<P: Provider = Miner> {
     network_id: Option<u64>,
-    parent1: Option<MessageId>,
-    parent2: Option<MessageId>,
+    parents: Option<Vec<MessageId>>,
     payload: Option<Payload>,
-    nonce_provider: Option<(P, f64)>,
+    nonce_provider: Option<(P, f64, Option<Arc<AtomicBool>>)>,
 }
 
 impl<P: Provider> Default for MessageBuilder<P> {
     fn default() -> Self {
         Self {
             network_id: None,
-            parent1: None,
-            parent2: None,
+            parents: None,
             payload: None,
             nonce_provider: None,
         }
@@ -159,13 +168,8 @@ impl<P: Provider> MessageBuilder<P> {
         self
     }
 
-    pub fn with_parent1(mut self, parent1: MessageId) -> Self {
-        self.parent1 = Some(parent1);
-        self
-    }
-
-    pub fn with_parent2(mut self, parent2: MessageId) -> Self {
-        self.parent2 = Some(parent2);
+    pub fn with_parents(mut self, parents: Vec<MessageId>) -> Self {
+        self.parents = Some(parents);
         self
     }
 
@@ -174,19 +178,25 @@ impl<P: Provider> MessageBuilder<P> {
         self
     }
 
-    pub fn with_nonce_provider(mut self, nonce_provider: P, target_score: f64) -> Self {
-        self.nonce_provider = Some((nonce_provider, target_score));
+    pub fn with_nonce_provider(mut self, nonce_provider: P, target_score: f64, done: Option<Arc<AtomicBool>>) -> Self {
+        self.nonce_provider = Some((nonce_provider, target_score, done));
         self
     }
 
     pub fn finish(self) -> Result<Message, Error> {
         let mut message = Message {
             network_id: self.network_id.ok_or(Error::MissingField("network_id"))?,
-            parent1: self.parent1.ok_or(Error::MissingField("parent1"))?,
-            parent2: self.parent2.ok_or(Error::MissingField("parent2"))?,
+            parents: self.parents.ok_or(Error::MissingField("parents"))?,
             payload: self.payload,
             nonce: 0,
         };
+
+        if !MESSAGE_PARENTS_RANGE.contains(&message.parents.len()) {
+            return Err(Error::InvalidParentsCount(message.parents.len()));
+        }
+
+        message.parents.sort_unstable();
+        message.parents.dedup();
 
         let message_bytes = message.pack_new();
 
@@ -194,12 +204,15 @@ impl<P: Provider> MessageBuilder<P> {
             return Err(Error::InvalidMessageLength(message_bytes.len()));
         }
 
-        let (nonce_provider, target_score) = self.nonce_provider.unwrap_or((P::Builder::new().finish(), 4000f64));
+        let (nonce_provider, target_score, done) =
+            self.nonce_provider
+                .unwrap_or((P::Builder::new().finish(), 4000f64, None));
 
         message.nonce = nonce_provider
             .nonce(
                 &message_bytes[..message_bytes.len() - std::mem::size_of::<u64>()],
                 target_score,
+                done,
             )
             .unwrap_or(0);
 

@@ -1,7 +1,7 @@
 // Copyright 2020 IOTA Stiftung
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{error::Error, storage::*};
+use crate::{error::Error, storage::*, system::System};
 
 use bee_common::packable::Packable;
 use bee_ledger::{balance::Balance, model::OutputDiff};
@@ -19,9 +19,23 @@ use bee_message::{
 };
 use bee_snapshot::info::SnapshotInfo;
 use bee_storage::access::Fetch;
-use bee_tangle::metadata::MessageMetadata;
+use bee_tangle::{metadata::MessageMetadata, unconfirmed_message::UnconfirmedMessage};
 
 use std::convert::TryInto;
+
+#[async_trait::async_trait]
+impl Fetch<u8, System> for Storage {
+    async fn fetch(&self, key: &u8) -> Result<Option<System>, <Self as StorageBackend>::Error> {
+        let cf = self.inner.cf_handle(CF_SYSTEM).ok_or(Error::UnknownCf(CF_SYSTEM))?;
+
+        if let Some(res) = self.inner.get_cf(&cf, [*key])? {
+            // Unpacking from storage is fine.
+            Ok(Some(System::unpack(&mut res.as_slice()).unwrap()))
+        } else {
+            Ok(None)
+        }
+    }
+}
 
 #[async_trait::async_trait]
 impl Fetch<MessageId, Message> for Storage {
@@ -258,5 +272,30 @@ impl Fetch<Address, Balance> for Storage {
         } else {
             Ok(None)
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl Fetch<MilestoneIndex, Vec<UnconfirmedMessage>> for Storage {
+    async fn fetch(
+        &self,
+        index: &MilestoneIndex,
+    ) -> Result<Option<Vec<UnconfirmedMessage>>, <Self as StorageBackend>::Error> {
+        let cf = self
+            .inner
+            .cf_handle(CF_MILESTONE_INDEX_TO_UNCONFIRMED_MESSAGE)
+            .ok_or(Error::UnknownCf(CF_MILESTONE_INDEX_TO_UNCONFIRMED_MESSAGE))?;
+
+        Ok(Some(
+            self.inner
+                .prefix_iterator_cf(&cf, index.pack_new())
+                .map(|(key, _)| {
+                    let (_, unconfirmed_message) = key.split_at(std::mem::size_of::<MilestoneIndex>());
+                    // Unpacking from storage is fine.
+                    let unconfirmed_message: [u8; MESSAGE_ID_LENGTH] = unconfirmed_message.try_into().unwrap();
+                    UnconfirmedMessage::from(MessageId::from(unconfirmed_message))
+                })
+                .collect(),
+        ))
     }
 }

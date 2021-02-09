@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    filters::CustomRejection::NotFound,
+    filters::CustomRejection::{NotFound, ServiceUnavailable},
     handlers::{BodyInner, SuccessBody},
     storage::StorageBackend,
+    IS_SYNCED_THRESHOLD,
 };
 
 use bee_ledger::conflict::ConflictReason;
@@ -19,7 +20,12 @@ pub(crate) async fn message_metadata<B: StorageBackend>(
     message_id: MessageId,
     tangle: ResourceHandle<MsTangle<B>>,
 ) -> Result<impl Reply, Rejection> {
-    // TODO: response only when the node is synced
+    if !tangle.is_synced_threshold(IS_SYNCED_THRESHOLD) {
+        return Err(reject::custom(ServiceUnavailable(
+            "the node is not synchronized".to_string(),
+        )));
+    }
+
     match tangle.get(&message_id).await.map(|m| (*m).clone()) {
         Some(message) => {
             // existing message <=> existing metadata, therefore unwrap() is safe
@@ -122,8 +128,7 @@ pub(crate) async fn message_metadata<B: StorageBackend>(
 
             Ok(warp::reply::json(&SuccessBody::new(MessageMetadataResponse {
                 message_id: message_id.to_string(),
-                parent_1_message_id: message.parent1().to_string(),
-                parent_2_message_id: message.parent2().to_string(),
+                parent_message_ids: message.parents().iter().map(|id| id.to_string()).collect(),
                 is_solid,
                 referenced_by_milestone_index,
                 milestone_index,
@@ -142,10 +147,8 @@ pub(crate) async fn message_metadata<B: StorageBackend>(
 pub struct MessageMetadataResponse {
     #[serde(rename = "messageId")]
     pub message_id: String,
-    #[serde(rename = "parent1MessageId")]
-    pub parent_1_message_id: String,
-    #[serde(rename = "parent2MessageId")]
-    pub parent_2_message_id: String,
+    #[serde(rename = "parentMessageIds")]
+    pub parent_message_ids: Vec<String>,
     #[serde(rename = "isSolid")]
     pub is_solid: bool,
     #[serde(skip_serializing_if = "Option::is_none")]

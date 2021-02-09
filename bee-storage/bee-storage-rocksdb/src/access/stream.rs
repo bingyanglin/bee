@@ -1,7 +1,7 @@
 // Copyright 2020 IOTA Stiftung
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{error::Error, storage::*};
+use crate::{error::Error, storage::*, system::System};
 
 use bee_common::packable::Packable;
 use bee_ledger::{
@@ -20,7 +20,7 @@ use bee_message::{
 };
 use bee_snapshot::info::SnapshotInfo;
 use bee_storage::access::AsStream;
-use bee_tangle::metadata::MessageMetadata;
+use bee_tangle::{metadata::MessageMetadata, unconfirmed_message::UnconfirmedMessage};
 
 use futures::{
     stream::Stream,
@@ -98,6 +98,17 @@ macro_rules! impl_stream {
             }
         }
     };
+}
+
+impl<'a> StorageStream<'a, u8, System> {
+    fn unpack_key_value(mut key: &[u8], mut value: &[u8]) -> (u8, System) {
+        (
+            // Unpacking from storage is fine.
+            u8::unpack(&mut key).unwrap(),
+            // Unpacking from storage is fine.
+            System::unpack(&mut value).unwrap(),
+        )
+    }
 }
 
 impl<'a> StorageStream<'a, MessageId, Message> {
@@ -265,6 +276,23 @@ impl<'a> StorageStream<'a, Address, Balance> {
     }
 }
 
+impl<'a> StorageStream<'a, (MilestoneIndex, UnconfirmedMessage), ()> {
+    fn unpack_key_value(key: &[u8], _: &[u8]) -> ((MilestoneIndex, UnconfirmedMessage), ()) {
+        let (mut index, mut unconfirmed_message) = key.split_at(std::mem::size_of::<MilestoneIndex>());
+
+        (
+            (
+                // Unpacking from storage is fine.
+                MilestoneIndex::unpack(&mut index).unwrap(),
+                // Unpacking from storage is fine.
+                UnconfirmedMessage::unpack(&mut unconfirmed_message).unwrap(),
+            ),
+            (),
+        )
+    }
+}
+
+impl_stream!(u8, System, CF_SYSTEM);
 impl_stream!(MessageId, Message, CF_MESSAGE_ID_TO_MESSAGE);
 impl_stream!(MessageId, MessageMetadata, CF_MESSAGE_ID_TO_METADATA);
 impl_stream!((MessageId, MessageId), (), CF_MESSAGE_ID_TO_MESSAGE_ID);
@@ -279,3 +307,8 @@ impl_stream!((), SnapshotInfo, CF_SNAPSHOT_INFO);
 impl_stream!(SolidEntryPoint, MilestoneIndex, CF_SOLID_ENTRY_POINT_TO_MILESTONE_INDEX);
 impl_stream!(MilestoneIndex, OutputDiff, CF_MILESTONE_INDEX_TO_OUTPUT_DIFF);
 impl_stream!(Address, Balance, CF_ADDRESS_TO_BALANCE);
+impl_stream!(
+    (MilestoneIndex, UnconfirmedMessage),
+    (),
+    CF_MILESTONE_INDEX_TO_UNCONFIRMED_MESSAGE
+);

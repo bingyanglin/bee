@@ -4,11 +4,16 @@
 use super::{
     config::{RocksDBConfig, RocksDBConfigBuilder, StorageConfig},
     error::Error,
+    system::{System, STORAGE_VERSION, STORAGE_VERSION_KEY},
 };
 
-pub use bee_storage::backend::StorageBackend;
+pub use bee_storage::{
+    access::{Fetch, Insert},
+    backend::StorageBackend,
+};
 
 use bee_message::{
+    milestone::MilestoneIndex,
     payload::{indexation::HASHED_INDEX_LENGTH, transaction::ED25519_ADDRESS_LENGTH},
     MESSAGE_ID_LENGTH,
 };
@@ -16,6 +21,7 @@ use bee_message::{
 use async_trait::async_trait;
 use rocksdb::{ColumnFamilyDescriptor, DBCompactionStyle, DBCompressionType, Env, Options, SliceTransform, DB};
 
+pub const CF_SYSTEM: &str = "system";
 pub const CF_MESSAGE_ID_TO_MESSAGE: &str = "message_id_to_message";
 pub const CF_MESSAGE_ID_TO_METADATA: &str = "message_id_to_metadata";
 pub const CF_MESSAGE_ID_TO_MESSAGE_ID: &str = "message_id_to_message_id";
@@ -30,6 +36,7 @@ pub const CF_SNAPSHOT_INFO: &str = "snapshot_info";
 pub const CF_SOLID_ENTRY_POINT_TO_MILESTONE_INDEX: &str = "solid_entry_point_to_milestone_index";
 pub const CF_MILESTONE_INDEX_TO_OUTPUT_DIFF: &str = "milestone_index_to_output_diff";
 pub const CF_ADDRESS_TO_BALANCE: &str = "address_to_balance";
+pub const CF_MILESTONE_INDEX_TO_UNCONFIRMED_MESSAGE: &str = "milestone_index_to_unconfirmed_message";
 
 pub struct Storage {
     pub(crate) config: StorageConfig,
@@ -38,6 +45,8 @@ pub struct Storage {
 
 impl Storage {
     pub fn try_new(config: RocksDBConfig) -> Result<DB, Error> {
+        let cf_system = ColumnFamilyDescriptor::new(CF_SYSTEM, Options::default());
+
         let cf_message_id_to_message = ColumnFamilyDescriptor::new(CF_MESSAGE_ID_TO_MESSAGE, Options::default());
 
         let cf_message_id_to_metadata = ColumnFamilyDescriptor::new(CF_MESSAGE_ID_TO_METADATA, Options::default());
@@ -80,6 +89,12 @@ impl Storage {
 
         let cf_address_to_balance = ColumnFamilyDescriptor::new(CF_ADDRESS_TO_BALANCE, Options::default());
 
+        let prefix_extractor = SliceTransform::create_fixed_prefix(std::mem::size_of::<MilestoneIndex>());
+        let mut options = Options::default();
+        options.set_prefix_extractor(prefix_extractor);
+        let cf_milestone_index_to_unconfirmed_message =
+            ColumnFamilyDescriptor::new(CF_MILESTONE_INDEX_TO_UNCONFIRMED_MESSAGE, options);
+
         let mut opts = Options::default();
 
         opts.create_if_missing(config.create_if_missing);
@@ -105,6 +120,7 @@ impl Storage {
         opts.set_disable_auto_compactions(config.set_disable_auto_compactions);
         opts.set_compression_type(DBCompressionType::from(config.set_compression_type));
         opts.set_unordered_write(config.set_unordered_write);
+        opts.set_use_direct_io_for_flush_and_compaction(config.set_use_direct_io_for_flush_and_compaction);
 
         let mut env = Env::default()?;
         env.set_background_threads(config.env.set_background_threads);
@@ -112,6 +128,7 @@ impl Storage {
         opts.set_env(&env);
 
         let column_familes = vec![
+            cf_system,
             cf_message_id_to_message,
             cf_message_id_to_metadata,
             cf_message_id_to_message_id,
@@ -126,6 +143,7 @@ impl Storage {
             cf_solid_entry_point_to_milestone_index,
             cf_milestone_index_to_output_diff,
             cf_address_to_balance,
+            cf_milestone_index_to_unconfirmed_message,
         ];
 
         Ok(DB::open_cf_descriptors(&opts, config.path, column_familes)?)
@@ -140,10 +158,24 @@ impl StorageBackend for Storage {
 
     /// It starts RocksDB instance and then initializes the required column familes.
     async fn start(config: Self::Config) -> Result<Self, Self::Error> {
-        Ok(Storage {
+        let storage = Storage {
             config: config.storage.clone(),
             inner: Self::try_new(config)?,
-        })
+        };
+
+        match Fetch::<u8, System>::fetch(&storage, &STORAGE_VERSION_KEY).await? {
+            Some(System::Version(version)) => {
+                if version != STORAGE_VERSION {
+                    return Err(Error::VersionMismatch(version, STORAGE_VERSION));
+                }
+            }
+            None => {
+                Insert::<u8, System>::insert(&storage, &STORAGE_VERSION_KEY, &System::Version(STORAGE_VERSION)).await?
+            }
+            _ => panic!("Another system value was inserted on the version key."),
+        }
+
+        Ok(storage)
     }
 
     /// It shutdown RocksDB instance.
